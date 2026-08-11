@@ -1,8 +1,7 @@
 import time
 import requests
 from datetime import datetime, timezone
-
-BYBIT_URL = "https://api.bybit.com/v5/market/kline"
+BYBIT_URL = "https://api2.bybit.com/v5/market/kline"
 SYMBOL = "BTCUSDT"
 INTERVAL = "15"
 LIMIT = 10
