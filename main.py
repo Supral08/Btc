@@ -1,10 +1,11 @@
 import os
 import time
+import json
 import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 # ============================================================
@@ -17,29 +18,146 @@ SYMBOL = "BTCUSDT"
 INTERVAL = "15m"
 
 POLL_SECONDS = 15
-CANDLE_LIMIT = 60
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# Nombre de bougies M15 observées APRÈS le contact
+OBSERVATION_CANDLES = int(
+    os.getenv("OBSERVATION_CANDLES", "8")
+)
 
-# Format recommandé :
-#
-# LIQUIDITY_LEVELS=
-# BSL:65576.8,66157.4,66968.5;
-# SSL:64689,63987.9,63724.1
-#
-LIQUIDITY_LEVELS = os.getenv("LIQUIDITY_LEVELS", "")
+TELEGRAM_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+)
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    ""
+)
+
+LIQUIDITY_LEVELS = os.getenv(
+    "LIQUIDITY_LEVELS",
+    ""
+)
+
+STATE_FILE = "smc_state.json"
 
 
 # ============================================================
-# ETAT GLOBAL
+# VARIABLES GLOBALES
 # ============================================================
+
+bot_running = True
 
 last_candle_time = None
 
-observation = None
+telegram_offset = 0
 
-bot_running = True
+# Observations actuellement actives
+active_observations = {}
+
+# Historique terminé
+completed_observations = []
+
+# Nouvelles zones détectées
+dynamic_zones = []
+
+
+# ============================================================
+# TEMPS
+# ============================================================
+
+def utc_now():
+    return datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def candle_datetime(timestamp):
+    return datetime.fromtimestamp(
+        timestamp / 1000,
+        tz=timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ============================================================
+# STOCKAGE
+# ============================================================
+
+def save_state():
+
+    data = {
+        "active_observations": active_observations,
+        "completed_observations": completed_observations[-20:],
+        "dynamic_zones": dynamic_zones[-100:]
+    }
+
+    try:
+
+        with open(
+            STATE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                data,
+                f,
+                indent=2
+            )
+
+    except Exception as e:
+
+        print(
+            f"[STATE] Erreur sauvegarde : {e}",
+            flush=True
+        )
+
+
+def load_state():
+
+    global active_observations
+    global completed_observations
+    global dynamic_zones
+
+    if not os.path.exists(STATE_FILE):
+        return
+
+    try:
+
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            data = json.load(f)
+
+        active_observations = data.get(
+            "active_observations",
+            {}
+        )
+
+        completed_observations = data.get(
+            "completed_observations",
+            []
+        )
+
+        dynamic_zones = data.get(
+            "dynamic_zones",
+            []
+        )
+
+        print(
+            "[STATE] Mémoire restaurée.",
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            f"[STATE] Impossible de restaurer : {e}",
+            flush=True
+        )
 
 
 # ============================================================
@@ -53,21 +171,31 @@ class HealthHandler(BaseHTTPRequestHandler):
         if self.path == "/":
 
             self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
+
+            self.send_header(
+                "Content-Type",
+                "text/plain"
+            )
+
             self.end_headers()
 
             self.wfile.write(
-                b"BTC SMC BOT V2 - ONLINE\n"
+                b"BTC SMC BOT V3 - ONLINE\n"
             )
 
         elif self.path == "/health":
 
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
+
             self.end_headers()
 
             self.wfile.write(
-                b'{"status":"online","bot":"BTC SMC V2"}'
+                b'{"status":"online","bot":"BTC SMC V3"}'
             )
 
         else:
@@ -81,7 +209,12 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_web_server():
 
-    port = int(os.getenv("PORT", "10000"))
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000"
+        )
+    )
 
     server = HTTPServer(
         ("0.0.0.0", port),
@@ -89,7 +222,8 @@ def start_web_server():
     )
 
     print(
-        f"[{utc_now()}] Serveur HTTP Render actif sur port {port}",
+        f"[{utc_now()}] "
+        f"Serveur HTTP Render actif sur port {port}",
         flush=True
     )
 
@@ -97,96 +231,50 @@ def start_web_server():
 
 
 # ============================================================
-# OUTILS
-# ============================================================
-
-def utc_now():
-
-    return datetime.now(
-        timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def candle_time(candle):
-
-    return datetime.fromtimestamp(
-        candle["open_time"] / 1000,
-        tz=timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-# ============================================================
-# LIQUIDITÉS
+# LIQUIDITÉ
 # ============================================================
 
 def parse_levels():
 
-    result = {
-        "BSL": [],
-        "SSL": []
-    }
-
     if not LIQUIDITY_LEVELS.strip():
-        return result
+        return []
 
-    try:
+    levels = []
 
-        sections = LIQUIDITY_LEVELS.split(";")
+    for value in LIQUIDITY_LEVELS.split(","):
 
-        for section in sections:
+        value = value.strip()
 
-            if ":" not in section:
-                continue
+        try:
 
-            role, values = section.split(":", 1)
+            levels.append(
+                float(value)
+            )
 
-            role = role.strip().upper()
+        except ValueError:
 
-            if role not in result:
-                continue
+            print(
+                f"[WARNING] Niveau invalide : {value}",
+                flush=True
+            )
 
-            for value in values.split(","):
-
-                value = value.strip()
-
-                try:
-                    result[role].append(float(value))
-
-                except ValueError:
-
-                    print(
-                        f"[WARNING] Niveau invalide : {value}",
-                        flush=True
-                    )
-
-    except Exception as e:
-
-        print(
-            f"[ERREUR LEVELS] {e}",
-            flush=True
-        )
-
-    return result
+    return levels
 
 
-def all_levels():
+def get_current_levels():
 
-    levels = parse_levels()
+    """
+    Les niveaux peuvent venir de Render
+    ou être modifiés avec /levels.
+    """
 
-    return levels["BSL"] + levels["SSL"]
+    if dynamic_zones:
 
+        # Les zones dynamiques ne remplacent pas
+        # les niveaux principaux.
+        pass
 
-def get_level_role(level):
-
-    levels = parse_levels()
-
-    if level in levels["BSL"]:
-        return "BSL"
-
-    if level in levels["SSL"]:
-        return "SSL"
-
-    return "UNKNOWN"
+    return parse_levels()
 
 
 # ============================================================
@@ -195,10 +283,19 @@ def get_level_role(level):
 
 def telegram_send(message):
 
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN:
 
         print(
-            "[TELEGRAM] Token ou Chat ID non configuré.",
+            "[TELEGRAM] Token non configuré.",
+            flush=True
+        )
+
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+
+        print(
+            "[TELEGRAM] CHAT_ID non configuré.",
             flush=True
         )
 
@@ -229,18 +326,362 @@ def telegram_send(message):
     except Exception as e:
 
         print(
-            f"[ERREUR TELEGRAM] {type(e).__name__}: {e}",
+            f"[TELEGRAM] Erreur : "
+            f"{type(e).__name__} - {e}",
             flush=True
         )
 
         return False
 
 
+def telegram_api(method, params=None):
+
+    if not TELEGRAM_TOKEN:
+        return None
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_TOKEN}/{method}"
+    )
+
+    try:
+
+        response = requests.get(
+            url,
+            params=params,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    except Exception as e:
+
+        print(
+            f"[TELEGRAM API] {method} : {e}",
+            flush=True
+        )
+
+        return None
+
+
+# ============================================================
+# COMMANDES TELEGRAM
+# ============================================================
+
+def handle_command(text):
+
+    global LIQUIDITY_LEVELS
+    global active_observations
+    global dynamic_zones
+
+    if not text:
+        return
+
+    parts = text.strip().split()
+
+    command = parts[0].lower()
+
+    # --------------------------------------------------------
+    # /start
+    # --------------------------------------------------------
+
+    if command == "/start":
+
+        telegram_send(
+            "🤖 BTC SMC BOT V3\n\n"
+            "Bot opérationnel.\n\n"
+            "Commandes disponibles :\n"
+            "/levels 63900 63600\n"
+            "/levels\n"
+            "/status\n"
+            "/zones\n"
+            "/reset\n"
+            "/clear"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # /levels
+    # --------------------------------------------------------
+
+    if command == "/levels":
+
+        if len(parts) == 1:
+
+            levels = parse_levels()
+
+            if not levels:
+
+                telegram_send(
+                    "⚠️ Aucun niveau principal configuré."
+                )
+
+                return
+
+            message = (
+                "📊 NIVEAUX PRINCIPAUX\n\n"
+            )
+
+            for i, level in enumerate(
+                levels,
+                start=1
+            ):
+
+                message += (
+                    f"{i}. {level:.2f}\n"
+                )
+
+            telegram_send(message)
+
+            return
+
+        new_levels = []
+
+        for value in parts[1:]:
+
+            try:
+
+                new_levels.append(
+                    float(value)
+                )
+
+            except ValueError:
+
+                pass
+
+        if not new_levels:
+
+            telegram_send(
+                "❌ Aucun niveau valide."
+            )
+
+            return
+
+        # Mise à jour en mémoire
+        LIQUIDITY_LEVELS = ",".join(
+            str(x)
+            for x in new_levels
+        )
+
+        telegram_send(
+            "✅ NIVEAUX MIS À JOUR\n\n"
+            + "\n".join(
+                f"• {x:.2f}"
+                for x in new_levels
+            )
+            + "\n\n"
+            "Le bot surveille maintenant "
+            "ces niveaux."
+        )
+
+        print(
+            "[LIQUIDITÉ] Niveaux mis à jour via Telegram : "
+            f"{LIQUIDITY_LEVELS}",
+            flush=True
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # /status
+    # --------------------------------------------------------
+
+    if command == "/status":
+
+        levels = parse_levels()
+
+        message = (
+            "📡 BTC SMC BOT V3\n\n"
+            f"État : ACTIF\n"
+            f"Symbole : {SYMBOL}\n"
+            f"Timeframe : {INTERVAL}\n"
+            f"Observation : "
+            f"{OBSERVATION_CANDLES} bougies\n\n"
+            f"Niveaux : {len(levels)}\n"
+            f"Observations actives : "
+            f"{len(active_observations)}\n"
+            f"Zones dynamiques : "
+            f"{len(dynamic_zones)}"
+        )
+
+        telegram_send(message)
+
+        return
+
+    # --------------------------------------------------------
+    # /zones
+    # --------------------------------------------------------
+
+    if command == "/zones":
+
+        if not dynamic_zones:
+
+            telegram_send(
+                "📭 Aucune nouvelle zone détectée."
+            )
+
+            return
+
+        message = (
+            "🧭 NOUVELLES ZONES\n\n"
+        )
+
+        for zone in dynamic_zones[-10:]:
+
+            message += (
+                f"• {zone['type']} : "
+                f"{zone['price']:.2f}\n"
+                f"  Source : "
+                f"{zone['source_level']:.2f}\n"
+                f"  Temps : "
+                f"{zone['time']}\n\n"
+            )
+
+        telegram_send(message)
+
+        return
+
+    # --------------------------------------------------------
+    # /reset
+    # --------------------------------------------------------
+
+    if command == "/reset":
+
+        active_observations.clear()
+        completed_observations.clear()
+
+        save_state()
+
+        telegram_send(
+            "♻️ MÉMOIRE RÉINITIALISÉE.\n\n"
+            "Les niveaux principaux restent actifs."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # /clear
+    # --------------------------------------------------------
+
+    if command == "/clear":
+
+        active_observations.clear()
+        completed_observations.clear()
+        dynamic_zones.clear()
+
+        save_state()
+
+        telegram_send(
+            "🗑️ Mémoire, observations et "
+            "zones dynamiques supprimées."
+        )
+
+        return
+
+
+def telegram_listener():
+
+    global telegram_offset
+
+    print(
+        "[TELEGRAM] Écoute des commandes activée.",
+        flush=True
+    )
+
+    # Évite les anciens messages accumulés
+    result = telegram_api(
+        "getUpdates",
+        {
+            "offset": -1,
+            "timeout": 1
+        }
+    )
+
+    if result and result.get("ok"):
+
+        updates = result.get(
+            "result",
+            []
+        )
+
+        if updates:
+
+            telegram_offset = (
+                updates[-1]["update_id"] + 1
+            )
+
+    while bot_running:
+
+        try:
+
+            result = telegram_api(
+                "getUpdates",
+                {
+                    "offset": telegram_offset,
+                    "timeout": 25
+                }
+            )
+
+            if not result or not result.get("ok"):
+
+                time.sleep(3)
+                continue
+
+            updates = result.get(
+                "result",
+                []
+            )
+
+            for update in updates:
+
+                telegram_offset = (
+                    update["update_id"] + 1
+                )
+
+                message = update.get(
+                    "message"
+                )
+
+                if not message:
+                    continue
+
+                chat_id = str(
+                    message["chat"]["id"]
+                )
+
+                # Sécurité : seul ton CHAT_ID
+                # peut contrôler le bot.
+                if str(TELEGRAM_CHAT_ID) != chat_id:
+
+                    continue
+
+                text = message.get(
+                    "text",
+                    ""
+                )
+
+                if text.startswith("/"):
+
+                    handle_command(text)
+
+        except Exception as e:
+
+            print(
+                f"[TELEGRAM LOOP] {type(e).__name__}: {e}",
+                flush=True
+            )
+
+            time.sleep(5)
+
+
 # ============================================================
 # BINANCE
 # ============================================================
 
-def get_candles(limit=CANDLE_LIMIT):
+def get_candles(limit=60):
 
     params = {
         "symbol": SYMBOL,
@@ -255,7 +696,7 @@ def get_candles(limit=CANDLE_LIMIT):
             params=params,
             timeout=15,
             headers={
-                "User-Agent": "BTC-SMC-Bot/2.0"
+                "User-Agent": "BTC-SMC-Bot/3.0"
             }
         )
 
@@ -268,21 +709,13 @@ def get_candles(limit=CANDLE_LIMIT):
         for row in data:
 
             candles.append({
-
                 "open_time": int(row[0]),
-
                 "open": float(row[1]),
-
                 "high": float(row[2]),
-
                 "low": float(row[3]),
-
                 "close": float(row[4]),
-
                 "volume": float(row[5]),
-
                 "close_time": int(row[6])
-
             })
 
         return candles
@@ -290,7 +723,8 @@ def get_candles(limit=CANDLE_LIMIT):
     except Exception as e:
 
         print(
-            f"[ERREUR BINANCE] {type(e).__name__}: {e}",
+            f"[BINANCE] Erreur : "
+            f"{type(e).__name__} - {e}",
             flush=True
         )
 
@@ -298,150 +732,39 @@ def get_candles(limit=CANDLE_LIMIT):
 
 
 # ============================================================
-# EMA
+# BOUGIE
 # ============================================================
 
-def ema(values, period):
+def print_candle(candle):
 
-    if len(values) < period:
-        return None
-
-    multiplier = 2 / (period + 1)
-
-    result = sum(values[:period]) / period
-
-    for value in values[period:]:
-
-        result = (
-            (value - result) * multiplier
-        ) + result
-
-    return result
-
-
-# ============================================================
-# MACD
-# ============================================================
-
-def calculate_macd(candles):
-
-    closes = [
-        candle["close"]
-        for candle in candles
-    ]
-
-    if len(closes) < 35:
-        return None
-
-    ema12_values = []
-
-    ema26_values = []
-
-    # Calcul simplifié mais cohérent
-    # pour permettre le suivi du momentum.
-
-    def ema_series(values, period):
-
-        if len(values) < period:
-            return []
-
-        multiplier = 2 / (period + 1)
-
-        current = sum(values[:period]) / period
-
-        result = [current]
-
-        for value in values[period:]:
-
-            current = (
-                (value - current) * multiplier
-            ) + current
-
-            result.append(current)
-
-        return result
-
-    e12 = ema_series(closes, 12)
-    e26 = ema_series(closes, 26)
-
-    if not e12 or not e26:
-        return None
-
-    # Alignement approximatif des séries
-    length = min(len(e12), len(e26))
-
-    e12 = e12[-length:]
-    e26 = e26[-length:]
-
-    macd_values = [
-        a - b
-        for a, b in zip(e12, e26)
-    ]
-
-    if len(macd_values) < 10:
-        return None
-
-    signal = ema(
-        macd_values,
-        9
+    print(
+        "\n"
+        "----------------------------------------\n"
+        "BTCUSDT M15\n"
+        f"Ouverture : "
+        f"{candle_datetime(candle['open_time'])}\n"
+        f"Open       : {candle['open']:.2f}\n"
+        f"High       : {candle['high']:.2f}\n"
+        f"Low        : {candle['low']:.2f}\n"
+        f"Close      : {candle['close']:.2f}\n"
+        f"Volume     : {candle['volume']:.4f}\n"
+        "----------------------------------------",
+        flush=True
     )
 
-    if signal is None:
-        return None
-
-    macd_value = macd_values[-1]
-
-    histogram = macd_value - signal
-
-    previous_macd = macd_values[-2]
-
-    previous_signal = ema(
-        macd_values[:-1],
-        9
-    )
-
-    if previous_signal is None:
-        previous_histogram = None
-    else:
-        previous_histogram = (
-            previous_macd - previous_signal
-        )
-
-    return {
-        "macd": macd_value,
-        "signal": signal,
-        "histogram": histogram,
-        "previous_histogram": previous_histogram
-    }
-
 
 # ============================================================
-# EMA INDICATEURS
-# ============================================================
-
-def calculate_emas(candles):
-
-    closes = [
-        candle["close"]
-        for candle in candles
-    ]
-
-    return {
-        "ema7": ema(closes, 7),
-        "ema14": ema(closes, 14)
-    }
-
-
-# ============================================================
-# LIQUIDITÉ TOUCHÉE
+# CONTACT LIQUIDITÉ
 # ============================================================
 
 def detect_liquidity_touch(candle):
 
-    levels = all_levels()
+    levels = parse_levels()
 
     if not levels:
-        return None
+        return []
+
+    touched = []
 
     for level in levels:
 
@@ -451,1064 +774,707 @@ def detect_liquidity_touch(candle):
             <= candle["high"]
         ):
 
-            return level
+            touched.append(level)
 
-    return None
-
-
-# ============================================================
-# SWEEP
-# ============================================================
-
-def detect_sweep(candle, level, role):
-
-    if role == "SSL":
-
-        return (
-            candle["low"] < level
-            and candle["close"] > level
-        )
-
-    if role == "BSL":
-
-        return (
-            candle["high"] > level
-            and candle["close"] < level
-        )
-
-    return False
+    return touched
 
 
 # ============================================================
-# CASSURE
+# CRÉATION OBSERVATION
 # ============================================================
 
-def detect_breakout(candles, level, role):
-
-    if len(candles) < 2:
-        return False
-
-    c1 = candles[-2]
-    c2 = candles[-1]
-
-    if role == "SSL":
-
-        return (
-            c1["close"] < level
-            and c2["close"] < level
-        )
-
-    if role == "BSL":
-
-        return (
-            c1["close"] > level
-            and c2["close"] > level
-        )
-
-    return False
-
-
-# ============================================================
-# REJET
-# ============================================================
-
-def detect_rejection(candles, level, role):
-
-    if len(candles) < 2:
-        return False
-
-    c1 = candles[-2]
-    c2 = candles[-1]
-
-    if role == "SSL":
-
-        return (
-            c1["close"] > level
-            and c2["close"] > level
-            and min(c1["low"], c2["low"]) <= level
-        )
-
-    if role == "BSL":
-
-        return (
-            c1["close"] < level
-            and c2["close"] < level
-            and max(c1["high"], c2["high"]) >= level
-        )
-
-    return False
-
-
-# ============================================================
-# CONSOLIDATION
-# ============================================================
-
-def detect_consolidation(candles):
-
-    if len(candles) < 4:
-        return False
-
-    recent = candles[-4:]
-
-    highs = [
-        c["high"]
-        for c in recent
-    ]
-
-    lows = [
-        c["low"]
-        for c in recent
-    ]
-
-    highest = max(highs)
-    lowest = min(lows)
-
-    range_size = highest - lowest
-
-    if range_size <= 0:
-        return False
-
-    # Aucun nouveau high/low extrêmement dominant.
-    last = recent[-1]
-
-    previous_high = max(
-        c["high"]
-        for c in recent[:-1]
-    )
-
-    previous_low = min(
-        c["low"]
-        for c in recent[:-1]
-    )
-
-    return (
-        last["high"] <= previous_high
-        and last["low"] >= previous_low
-    )
-
-
-# ============================================================
-# DOUBLE SWEEP
-# ============================================================
-
-def detect_double_sweep(candles, level, role):
-
-    if len(candles) < 4:
-        return False
-
-    recent = candles[-6:]
-
-    sweeps = []
-
-    for candle in recent:
-
-        if detect_sweep(
-            candle,
-            level,
-            role
-        ):
-
-            sweeps.append(candle)
-
-    if len(sweeps) < 2:
-        return False
-
-    return True
-
-
-# ============================================================
-# ACCEPTATION / REJET DU PRIX
-# ============================================================
-
-def detect_acceptance(candles, level, role):
-
-    if len(candles) < 3:
-        return False
-
-    recent = candles[-3:]
-
-    if role == "SSL":
-
-        return all(
-            c["close"] < level
-            for c in recent
-        )
-
-    if role == "BSL":
-
-        return all(
-            c["close"] > level
-            for c in recent
-        )
-
-    return False
-
-
-def detect_price_rejection(candles, level, role):
-
-    if len(candles) < 3:
-        return False
-
-    recent = candles[-3:]
-
-    if role == "SSL":
-
-        return all(
-            c["close"] > level
-            for c in recent
-        )
-
-    if role == "BSL":
-
-        return all(
-            c["close"] < level
-            for c in recent
-        )
-
-    return False
-
-
-# ============================================================
-# STRUCTURE
-# ============================================================
-
-def recent_swing_high(candles):
-
-    if len(candles) < 5:
-        return None
-
-    c1 = candles[-3]
-
-    if (
-        c1["high"] > candles[-4]["high"]
-        and
-        c1["high"] > candles[-2]["high"]
-    ):
-
-        return c1["high"]
-
-    return None
-
-
-def recent_swing_low(candles):
-
-    if len(candles) < 5:
-        return None
-
-    c1 = candles[-3]
-
-    if (
-        c1["low"] < candles[-4]["low"]
-        and
-        c1["low"] < candles[-2]["low"]
-    ):
-
-        return c1["low"]
-
-    return None
-
-
-# ============================================================
-# MSS
-# ============================================================
-
-def detect_mss(candles):
-
-    if len(candles) < 15:
-
-        return {
-            "micro": None,
-            "intermediate": None,
-            "major": None
-        }
-
-    current_close = candles[-1]["close"]
-
-    # ------------------------------
-    # Micro
-    # ------------------------------
-
-    micro_high = max(
-        c["high"]
-        for c in candles[-5:-2]
-    )
-
-    micro_low = min(
-        c["low"]
-        for c in candles[-5:-2]
-    )
-
-    micro_bull = current_close > micro_high
-    micro_bear = current_close < micro_low
-
-    # ------------------------------
-    # Intermediate
-    # ------------------------------
-
-    intermediate_high = max(
-        c["high"]
-        for c in candles[-12:-5]
-    )
-
-    intermediate_low = min(
-        c["low"]
-        for c in candles[-12:-5]
-    )
-
-    intermediate_bull = (
-        current_close > intermediate_high
-    )
-
-    intermediate_bear = (
-        current_close < intermediate_low
-    )
-
-    # ------------------------------
-    # Major
-    # ------------------------------
-
-    major_high = max(
-        c["high"]
-        for c in candles[:-3]
-    )
-
-    major_low = min(
-        c["low"]
-        for c in candles[:-3]
-    )
-
-    major_bull = current_close > major_high
-    major_bear = current_close < major_low
-
-    return {
-
-        "micro": {
-            "bullish": micro_bull,
-            "bearish": micro_bear,
-            "level_bull": micro_high,
-            "level_bear": micro_low
-        },
-
-        "intermediate": {
-            "bullish": intermediate_bull,
-            "bearish": intermediate_bear,
-            "level_bull": intermediate_high,
-            "level_bear": intermediate_low
-        },
-
-        "major": {
-            "bullish": major_bull,
-            "bearish": major_bear,
-            "level_bull": major_high,
-            "level_bear": major_low
-        }
-    }
-
-
-# ============================================================
-# DISPLACEMENT
-# ============================================================
-
-def detect_displacement(candles):
-
-    if len(candles) < 7:
-        return None
-
-    current = candles[-1]
-
-    bodies = []
-
-    for c in candles[-6:-1]:
-
-        bodies.append(
-            abs(c["close"] - c["open"])
-        )
-
-    average_body = (
-        sum(bodies) / len(bodies)
-    )
-
-    current_body = abs(
-        current["close"] - current["open"]
-    )
-
-    if average_body <= 0:
-        return None
-
-    body_ok = (
-        current_body > average_body
-    )
-
-    candle_range = (
-        current["high"] - current["low"]
-    )
-
-    if candle_range <= 0:
-        return None
-
-    close_position = (
-        current["close"] - current["low"]
-    ) / candle_range
-
-    bullish = (
-        current["close"]
-        > current["open"]
-        and
-        close_position >= 0.75
-    )
-
-    bearish = (
-        current["close"]
-        < current["open"]
-        and
-        close_position <= 0.25
-    )
-
-    previous_high = max(
-        c["high"]
-        for c in candles[-6:-1]
-    )
-
-    previous_low = min(
-        c["low"]
-        for c in candles[-6:-1]
-    )
-
-    bullish_structure_break = (
-        current["close"] > previous_high
-    )
-
-    bearish_structure_break = (
-        current["close"] < previous_low
-    )
-
-    bullish_confirmed = (
-        body_ok
-        and bullish
-        and bullish_structure_break
-    )
-
-    bearish_confirmed = (
-        body_ok
-        and bearish
-        and bearish_structure_break
-    )
-
-    if bullish_confirmed:
-
-        return {
-            "direction": "BUY",
-            "confirmed": True,
-            "average_body": average_body,
-            "body": current_body,
-            "close_position": close_position
-        }
-
-    if bearish_confirmed:
-
-        return {
-            "direction": "SELL",
-            "confirmed": True,
-            "average_body": average_body,
-            "body": current_body,
-            "close_position": close_position
-        }
-
-    return {
-        "direction": "NONE",
-        "confirmed": False,
-        "average_body": average_body,
-        "body": current_body,
-        "close_position": close_position
-    }
-
-
-# ============================================================
-# DOMINANCE
-# ============================================================
-
-def determine_dominance(candles):
-
-    macd = calculate_macd(candles)
-
-    if macd is None:
-        return "NEUTRE", macd
-
-    histogram = macd["histogram"]
-
-    if histogram > 0:
-        return "ACHETEURS DOMINANTS", macd
-
-    if histogram < 0:
-        return "VENDEURS DOMINANTS", macd
-
-    return "NEUTRE", macd
-
-
-# ============================================================
-# PULLBACK
-# ============================================================
-
-def detect_pullback(
-    candles,
-    displacement_direction
-):
-
-    if len(candles) < 5:
-        return {
-            "confirmed": False,
-            "voie": None
-        }
-
-    emas = calculate_emas(candles)
-
-    ema7 = emas["ema7"]
-    ema14 = emas["ema14"]
-
-    if ema7 is None or ema14 is None:
-        return {
-            "confirmed": False,
-            "voie": None
-        }
-
-    recent = candles[-4:]
-
-    if displacement_direction == "BUY":
-
-        # Voie B : stabilisation près des EMA
-        near_ema = any(
-            c["low"] <= max(ema7, ema14)
-            and
-            c["high"] >= min(ema7, ema14)
-            for c in recent
-        )
-
-        bullish_close = (
-            recent[-1]["close"]
-            > recent[-1]["open"]
-        )
-
-        if near_ema and bullish_close:
-
-            return {
-                "confirmed": True,
-                "voie": "B"
-            }
-
-    if displacement_direction == "SELL":
-
-        near_ema = any(
-            c["high"] >= min(ema7, ema14)
-            and
-            c["low"] <= max(ema7, ema14)
-            for c in recent
-        )
-
-        bearish_close = (
-            recent[-1]["close"]
-            < recent[-1]["open"]
-        )
-
-        if near_ema and bearish_close:
-
-            return {
-                "confirmed": True,
-                "voie": "B"
-            }
-
-    return {
-        "confirmed": False,
-        "voie": None
-    }
-
-
-# ============================================================
-# SCÉNARIO 7BIS
-# ============================================================
-
-def detect_7bis(
-    candles,
-    displacement,
-    mss
-):
-
-    if not displacement["confirmed"]:
-        return False
-
-    direction = displacement["direction"]
-
-    mss_ok = False
-
-    if direction == "BUY":
-
-        mss_ok = (
-            mss["intermediate"]["bullish"]
-            or
-            mss["major"]["bullish"]
-        )
-
-    elif direction == "SELL":
-
-        mss_ok = (
-            mss["intermediate"]["bearish"]
-            or
-            mss["major"]["bearish"]
-        )
-
-    if not mss_ok:
-        return False
-
-    if len(candles) < 5:
-        return False
-
-    # Recherche d'un mouvement continu
-    # sans véritable repli.
-
-    recent = candles[-4:]
-
-    if direction == "BUY":
-
-        continuous = all(
-            recent[i]["close"]
-            >= recent[i - 1]["close"]
-            for i in range(1, len(recent))
-        )
-
-    else:
-
-        continuous = all(
-            recent[i]["close"]
-            <= recent[i - 1]["close"]
-            for i in range(1, len(recent))
-        )
-
-    if not continuous:
-        return False
-
-    macd = calculate_macd(candles)
-
-    if macd is None:
-        return False
-
-    if direction == "BUY":
-
-        momentum_ok = (
-            macd["histogram"] > 0
-        )
-
-    else:
-
-        momentum_ok = (
-            macd["histogram"] < 0
-        )
-
-    return momentum_ok
-
-
-# ============================================================
-# RAPPORT PROTOCOLE
-# ============================================================
-
-def build_protocol_report(
-    candles,
+def create_observation(
     level,
-    role
+    candle
 ):
 
-    recent = candles[-1]
+    key = str(level)
 
-    # ------------------------------
-    # Étape 3
-    # ------------------------------
+    # Une observation du même niveau
+    # ne doit pas être recréée.
+    if key in active_observations:
 
-    sweep = detect_sweep(
-        recent,
-        level,
-        role
-    )
-
-    breakout = detect_breakout(
-        candles,
-        level,
-        role
-    )
-
-    rejection = detect_rejection(
-        candles,
-        level,
-        role
-    )
-
-    consolidation = detect_consolidation(
-        candles
-    )
-
-    double_sweep = detect_double_sweep(
-        candles,
-        level,
-        role
-    )
-
-    acceptance = detect_acceptance(
-        candles,
-        level,
-        role
-    )
-
-    price_rejection = detect_price_rejection(
-        candles,
-        level,
-        role
-    )
-
-    # ------------------------------
-    # Étape 4
-    # ------------------------------
-
-    dominance, macd = determine_dominance(
-        candles
-    )
-
-    # ------------------------------
-    # Étape 5
-    # ------------------------------
-
-    mss = detect_mss(candles)
-
-    # ------------------------------
-    # Étape 6
-    # ------------------------------
-
-    displacement = detect_displacement(
-        candles
-    )
-
-    # ------------------------------
-    # Étape 7
-    # ------------------------------
-
-    pullback = {
-        "confirmed": False,
-        "voie": None
-    }
-
-    if displacement["confirmed"]:
-
-        pullback = detect_pullback(
-            candles,
-            displacement["direction"]
-        )
-
-    # ------------------------------
-    # Étape 7bis
-    # ------------------------------
-
-    extension = detect_7bis(
-        candles,
-        displacement,
-        mss
-    )
-
-    # ------------------------------
-    # Verdict
-    # ------------------------------
-
-    verdict = "OBSERVATION EN COURS"
-
-    if displacement["confirmed"]:
-
-        direction = displacement["direction"]
-
-        mss_confirmed = False
-
-        if direction == "BUY":
-
-            mss_confirmed = (
-                mss["intermediate"]["bullish"]
-                or
-                mss["major"]["bullish"]
-            )
-
-        elif direction == "SELL":
-
-            mss_confirmed = (
-                mss["intermediate"]["bearish"]
-                or
-                mss["major"]["bearish"]
-            )
-
-        if mss_confirmed:
-
-            if pullback["confirmed"]:
-
-                verdict = (
-                    f"SETUP A+ — "
-                    f"{direction} — "
-                    f"VOIE {pullback['voie']}"
-                )
-
-            elif extension:
-
-                verdict = (
-                    f"SETUP A+ — {direction} — "
-                    "ÉTAPE 7BIS — "
-                    "RR RÉDUIT / RISQUE ACCRU"
-                )
-
-    # ------------------------------
-    # Rapport
-    # ------------------------------
-
-    lines = [
-
-        "========================================",
-        "BTC SMC — RAPPORT PROTOCOLE",
-        "========================================",
-
-        f"Liquidité : {level:.2f}",
-        f"Type : {role}",
-        f"Prix actuel : {recent['close']:.2f}",
-
-        "",
-        "ÉTAPE 3 — RÉACTION",
-
-        f"3.1 Sweep : {'OUI' if sweep else 'NON'}",
-        f"3.2 Cassure : {'OUI' if breakout else 'NON'}",
-        f"3.3 Rejet : {'OUI' if rejection else 'NON'}",
-        f"3.4 Consolidation : {'OUI' if consolidation else 'NON'}",
-        f"3.5 Double sweep : {'OUI' if double_sweep else 'NON'}",
-        f"3.6 Acceptation : {'OUI' if acceptance else 'NON'}",
-        f"3.7 Rejet du prix : {'OUI' if price_rejection else 'NON'}",
-
-        "",
-        "ÉTAPE 4 — DOMINANCE",
-
-        f"Dominance : {dominance}",
-
-        "",
-        "ÉTAPE 5 — MSS",
-
-        f"Micro : {mss['micro']}",
-        f"Intermédiaire : {mss['intermediate']}",
-        f"Major : {mss['major']}",
-
-        "",
-        "ÉTAPE 6 — DISPLACEMENT",
-
-        f"Direction : {displacement['direction']}",
-        f"Confirmé : {displacement['confirmed']}",
-
-        "",
-        "ÉTAPE 7 — PULLBACK",
-
-        f"Confirmé : {pullback['confirmed']}",
-        f"Voie : {pullback['voie']}",
-
-        "",
-        "ÉTAPE 7BIS",
-
-        f"Extension autorisée : {extension}",
-
-        "",
-        "MACD",
-
-    ]
-
-    if macd:
-
-        lines.extend([
-
-            f"MACD : {macd['macd']:.5f}",
-            f"Signal : {macd['signal']:.5f}",
-            f"Histogramme : {macd['histogram']:.5f}"
-
-        ])
-
-    else:
-
-        lines.append(
-            "MACD : INDISPONIBLE"
-        )
-
-    lines.extend([
-
-        "",
-        "========================================",
-        f"VERDICT : {verdict}",
-        "========================================",
-
-    ])
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# GESTION DE L'OBSERVATION
-# ============================================================
-
-def start_observation(candle, level):
-
-    global observation
-
-    role = get_level_role(level)
+        return
 
     observation = {
 
         "level": level,
 
-        "role": role,
+        "contact_candle": candle,
 
-        "touch_time": candle["open_time"],
+        "candles": [],
 
-        "candles_after": 0,
+        "created_at": utc_now(),
 
-        "completed": False
+        "status": "OBSERVATION",
+
+        "reaction": False,
+
+        "mss": False,
+
+        "displacement": False,
+
+        "rejection": False,
+
+        "new_zones": []
 
     }
 
-    message = (
+    active_observations[key] = observation
 
-        "🚨 LIQUIDITÉ BTC TOUCHÉE\n\n"
-
-        f"Type : {role}\n"
-        f"Niveau : {level:.2f}\n"
-
-        f"High : {candle['high']:.2f}\n"
-        f"Low : {candle['low']:.2f}\n"
-        f"Close : {candle['close']:.2f}\n\n"
-
-        "⚠️ ZONE D'INTÉRÊT\n"
-        "PAS D'ENTRÉE.\n\n"
-
-        "Observation obligatoire activée.\n"
-        "Attente : clôture de la bougie de contact "
-        "+ 1 bougie M15."
-
-    )
+    save_state()
 
     print(
-        message,
+        "\n"
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+        f"🚨 CONTACT LIQUIDITÉ : {level:.2f}\n"
+        "→ MÉMOIRE ACTIVÉE\n"
+        f"→ OBSERVATION : "
+        f"{OBSERVATION_CANDLES} M15\n"
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
         flush=True
     )
 
-    telegram_send(message)
+    telegram_send(
+        "🚨 CONTACT LIQUIDITÉ BTC\n\n"
+        f"Niveau : {level:.2f}\n"
+        f"Timeframe : {INTERVAL}\n"
+        f"Bougie contact : "
+        f"{candle_datetime(candle['open_time'])}\n\n"
+        f"📋 Mémoire activée.\n"
+        f"Observation des "
+        f"{OBSERVATION_CANDLES} prochaines bougies M15.\n\n"
+        "⚠️ Aucun BUY/SELL."
+    )
 
 
-def process_observation(candles):
+# ============================================================
+# ANALYSE BOUGIE
+# ============================================================
 
-    global observation
+def candle_rejection(
+    candle,
+    level
+):
 
-    if observation is None:
-        return
+    body = abs(
+        candle["close"]
+        - candle["open"]
+    )
 
-    level = observation["level"]
+    total_range = (
+        candle["high"]
+        - candle["low"]
+    )
 
-    role = observation["role"]
+    if total_range <= 0:
+        return False
 
-    touch_time = observation["touch_time"]
+    upper_wick = (
+        candle["high"]
+        - max(
+            candle["open"],
+            candle["close"]
+        )
+    )
 
-    after = [
+    lower_wick = (
+        min(
+            candle["open"],
+            candle["close"]
+        )
+        - candle["low"]
+    )
 
-        c for c in candles
+    # Rejet haussier du niveau
+    if (
+        candle["low"] <= level
+        and candle["close"] > level
+        and lower_wick > body
+    ):
+        return True
 
-        if c["open_time"] > touch_time
-    ]
+    # Rejet baissier du niveau
+    if (
+        candle["high"] >= level
+        and candle["close"] < level
+        and upper_wick > body
+    ):
+        return True
 
-    observation["candles_after"] = len(after)
+    return False
 
-    # Minimum :
-    # bougie de contact clôturée
-    # + une bougie suivante clôturée.
 
-    if len(after) < 1:
+def detect_displacement(
+    candles,
+    index
+):
 
-        print(
-            "[PROTOCOLE] Observation obligatoire en cours.",
-            flush=True
+    if index < 3:
+        return False
+
+    current = candles[index]
+
+    current_range = (
+        current["high"]
+        - current["low"]
+    )
+
+    previous_ranges = []
+
+    for c in candles[
+        max(0, index - 5):index
+    ]:
+
+        previous_ranges.append(
+            c["high"] - c["low"]
         )
 
-        return
+    if not previous_ranges:
+        return False
 
-    # Analyse uniquement après
-    # satisfaction de l'attente.
+    average_range = (
+        sum(previous_ranges)
+        / len(previous_ranges)
+    )
 
-    report = build_protocol_report(
-        candles,
-        level,
-        role
+    if average_range <= 0:
+        return False
+
+    # Displacement objectif :
+    # range nettement supérieur à la moyenne
+    # + clôture proche d'une extrémité.
+    bullish_close = (
+        current["close"]
+        - current["low"]
+    ) / current_range
+
+    bearish_close = (
+        current["high"]
+        - current["close"]
+    ) / current_range
+
+    if (
+        current_range
+        >= average_range * 1.5
+    ):
+
+        if (
+            bullish_close >= 0.70
+            or bearish_close >= 0.70
+        ):
+
+            return True
+
+    return False
+
+
+# ============================================================
+# SWINGS / NOUVELLES ZONES
+# ============================================================
+
+def detect_swing_high(
+    candles,
+    index
+):
+
+    if index < 1:
+        return False
+
+    if index >= len(candles) - 1:
+        return False
+
+    return (
+        candles[index]["high"]
+        > candles[index - 1]["high"]
+        and
+        candles[index]["high"]
+        >= candles[index + 1]["high"]
+    )
+
+
+def detect_swing_low(
+    candles,
+    index
+):
+
+    if index < 1:
+        return False
+
+    if index >= len(candles) - 1:
+        return False
+
+    return (
+        candles[index]["low"]
+        < candles[index - 1]["low"]
+        and
+        candles[index]["low"]
+        <= candles[index + 1]["low"]
+    )
+
+
+def register_dynamic_zone(
+    observation,
+    zone_type,
+    price
+):
+
+    source_level = observation["level"]
+
+    # Évite les doublons proches
+    for zone in dynamic_zones:
+
+        if (
+            zone["type"] == zone_type
+            and abs(
+                zone["price"] - price
+            ) < 1.0
+        ):
+
+            return
+
+    zone = {
+
+        "type": zone_type,
+
+        "price": price,
+
+        "source_level": source_level,
+
+        "time": utc_now()
+    }
+
+    dynamic_zones.append(zone)
+
+    observation["new_zones"].append(
+        zone
     )
 
     print(
-        report,
+        f"[NOUVELLE ZONE] "
+        f"{zone_type} : {price:.2f} "
+        f"(source {source_level:.2f})",
+        flush=True
+    )
+
+
+# ============================================================
+# MSS OBJECTIF
+# ============================================================
+
+def detect_mss(
+    candles
+):
+
+    if len(candles) < 4:
+        return False
+
+    # Structure simplifiée :
+    # recherche d'un dépassement du dernier
+    # swing pertinent.
+
+    last = candles[-1]
+
+    highs = [
+        c["high"]
+        for c in candles[:-1]
+    ]
+
+    lows = [
+        c["low"]
+        for c in candles[:-1]
+    ]
+
+    previous_high = max(highs)
+    previous_low = min(lows)
+
+    bullish_break = (
+        last["close"]
+        > previous_high
+    )
+
+    bearish_break = (
+        last["close"]
+        < previous_low
+    )
+
+    return (
+        bullish_break
+        or bearish_break
+    )
+
+
+# ============================================================
+# TRAITEMENT D'UNE BOUGIE D'OBSERVATION
+# ============================================================
+
+def process_observation_candle(
+    observation,
+    candle
+):
+
+    observation["candles"].append(
+        candle
+    )
+
+    candles = observation["candles"]
+
+    index = len(candles) - 1
+
+    # ----------------------------------------
+    # Rejet
+    # ----------------------------------------
+
+    if candle_rejection(
+        candle,
+        observation["level"]
+    ):
+
+        observation["rejection"] = True
+        observation["reaction"] = True
+
+    # ----------------------------------------
+    # Displacement
+    # ----------------------------------------
+
+    if detect_displacement(
+        candles,
+        index
+    ):
+
+        observation["displacement"] = True
+        observation["reaction"] = True
+
+    # ----------------------------------------
+    # MSS
+    # ----------------------------------------
+
+    if detect_mss(candles):
+
+        observation["mss"] = True
+        observation["reaction"] = True
+
+    # ----------------------------------------
+    # Swing zones
+    #
+    # On analyse l'avant-dernière bougie,
+    # car elle possède maintenant une bougie
+    # à droite pour confirmer le swing.
+    # ----------------------------------------
+
+    if len(candles) >= 3:
+
+        swing_index = len(candles) - 2
+
+        swing_candle = candles[
+            swing_index
+        ]
+
+        if detect_swing_high(
+            candles,
+            swing_index
+        ):
+
+            register_dynamic_zone(
+                observation,
+                "SWING_HIGH",
+                swing_candle["high"]
+            )
+
+        if detect_swing_low(
+            candles,
+            swing_index
+        ):
+
+            register_dynamic_zone(
+                observation,
+                "SWING_LOW",
+                swing_candle["low"]
+            )
+
+
+# ============================================================
+# RAPPORT STRUCTURÉ
+# ============================================================
+
+def generate_report(
+    observation
+):
+
+    candles = observation["candles"]
+
+    level = observation["level"]
+
+    report = []
+
+    report.append(
+        "📊 RAPPORT BTC SMC — OBSERVATION TERMINÉE"
+    )
+
+    report.append(
+        ""
+    )
+
+    report.append(
+        f"Liquidité surveillée : {level:.2f}"
+    )
+
+    report.append(
+        f"Bougie contact : "
+        f"{candle_datetime(observation['contact_candle']['open_time'])}"
+    )
+
+    report.append(
+        f"Nombre de bougies observées : "
+        f"{len(candles)}"
+    )
+
+    report.append("")
+
+    # ----------------------------------------
+    # Réaction
+    # ----------------------------------------
+
+    report.append(
+        "1️⃣ RÉACTION"
+    )
+
+    report.append(
+        f"Rejet : "
+        f"{'OUI' if observation['rejection'] else 'NON'}"
+    )
+
+    report.append(
+        f"Displacement : "
+        f"{'OUI' if observation['displacement'] else 'NON'}"
+    )
+
+    report.append(
+        f"MSS potentiel : "
+        f"{'OUI' if observation['mss'] else 'NON'}"
+    )
+
+    report.append("")
+
+    # ----------------------------------------
+    # Verdict objectif
+    # ----------------------------------------
+
+    report.append(
+        "2️⃣ ÉTAT DE LA RÉACTION"
+    )
+
+    if observation["reaction"]:
+
+        report.append(
+            "🟡 RÉACTION STRUCTURELLE DÉTECTÉE"
+        )
+
+    else:
+
+        report.append(
+            "⚪ AUCUNE RÉACTION EXPLOITABLE"
+        )
+
+    report.append("")
+
+    # ----------------------------------------
+    # Bougies
+    # ----------------------------------------
+
+    report.append(
+        "3️⃣ BOUGIES M15 MÉMORISÉES"
+    )
+
+    for i, candle in enumerate(
+        candles,
+        start=1
+    ):
+
+        report.append(
+            f"C{i} | "
+            f"O {candle['open']:.2f} | "
+            f"H {candle['high']:.2f} | "
+            f"L {candle['low']:.2f} | "
+            f"C {candle['close']:.2f}"
+        )
+
+    report.append("")
+
+    # ----------------------------------------
+    # Nouvelles zones
+    # ----------------------------------------
+
+    report.append(
+        "4️⃣ NOUVELLES ZONES / STRUCTURES"
+    )
+
+    if observation["new_zones"]:
+
+        for zone in observation["new_zones"]:
+
+            report.append(
+                f"• {zone['type']} : "
+                f"{zone['price']:.2f}"
+            )
+
+    else:
+
+        report.append(
+            "Aucune nouvelle zone détectée."
+        )
+
+    report.append("")
+
+    # ----------------------------------------
+    # Règle importante
+    # ----------------------------------------
+
+    report.append(
+        "5️⃣ RÈGLE"
+    )
+
+    report.append(
+        "Ce rapport est descriptif."
+    )
+
+    report.append(
+        "Aucun BUY/SELL automatique."
+    )
+
+    report.append(
+        "Aucune entrée validée."
+    )
+
+    report.append(
+        "Analyse sceptique externe nécessaire."
+    )
+
+    return "\n".join(report)
+
+
+# ============================================================
+# FIN D'OBSERVATION
+# ============================================================
+
+def finish_observation(
+    key
+):
+
+    observation = active_observations.get(
+        key
+    )
+
+    if not observation:
+        return
+
+    observation["status"] = "TERMINEE"
+
+    report = generate_report(
+        observation
+    )
+
+    print(
+        "\n"
+        "==================================================\n"
+        "RAPPORT OBSERVATION\n"
+        "==================================================\n"
+        f"{report}\n"
+        "==================================================",
         flush=True
     )
 
     telegram_send(report)
 
-    # On termine cette observation.
-    observation["completed"] = True
+    completed_observations.append(
+        observation
+    )
 
-    observation = None
+    del active_observations[key]
+
+    save_state()
 
 
 # ============================================================
-# TRAITEMENT BOUGIE
+# TRAITEMENT DES CONTACTS
 # ============================================================
 
-def process_candle(candles):
+def process_liquidity_contacts(
+    candle
+):
 
-    global observation
-
-    candle = candles[-1]
-
-    # --------------------------------------------------------
-    # Si une observation est déjà active
-    # --------------------------------------------------------
-
-    if observation is not None:
-
-        process_observation(candles)
-
-        return
-
-    # --------------------------------------------------------
-    # Sinon recherche d'une nouvelle liquidité
-    # --------------------------------------------------------
-
-    touched_level = detect_liquidity_touch(
+    touched_levels = detect_liquidity_touch(
         candle
     )
 
-    if touched_level is None:
-        return
+    for level in touched_levels:
 
-    start_observation(
-        candle,
-        touched_level
-    )
+        create_observation(
+            level,
+            candle
+        )
 
 
 # ============================================================
-# AFFICHAGE BOUGIE
+# SURVEILLANCE DES OBSERVATIONS
 # ============================================================
 
-def print_candle(candle):
+def update_active_observations(
+    candle
+):
 
-    print(
+    finished = []
 
-        "\n"
-        "----------------------------------------\n"
-        "BTCUSDT M15\n"
-        f"Ouverture : {candle_time(candle)}\n"
-        f"Open       : {candle['open']:.2f}\n"
-        f"High       : {candle['high']:.2f}\n"
-        f"Low        : {candle['low']:.2f}\n"
-        f"Close      : {candle['close']:.2f}\n"
-        f"Volume     : {candle['volume']:.4f}\n"
-        "----------------------------------------",
+    for key, observation in list(
+        active_observations.items()
+    ):
 
-        flush=True
-    )
+        # Ne pas utiliser la bougie contact
+        # comme première bougie d'observation.
+        if (
+            candle["open_time"]
+            <= observation[
+                "contact_candle"
+            ]["open_time"]
+        ):
+
+            continue
+
+        # Empêche de mémoriser deux fois
+        # la même bougie.
+        already = any(
+            c["open_time"]
+            == candle["open_time"]
+            for c in observation["candles"]
+        )
+
+        if already:
+            continue
+
+        process_observation_candle(
+            observation,
+            candle
+        )
+
+        count = len(
+            observation["candles"]
+        )
+
+        print(
+            f"[OBSERVATION] "
+            f"Niveau {observation['level']:.2f} "
+            f"→ {count}/"
+            f"{OBSERVATION_CANDLES} bougies",
+            flush=True
+        )
+
+        if count >= OBSERVATION_CANDLES:
+
+            finished.append(key)
+
+    for key in finished:
+
+        finish_observation(key)
 
 
 # ============================================================
@@ -1525,7 +1491,7 @@ def trading_loop():
     )
 
     print(
-        "BTC SMC BOT V2 - PROTOCOLE",
+        "BTC SMC BOT V3 - PROTOCOLE",
         flush=True
     )
 
@@ -1545,32 +1511,33 @@ def trading_loop():
     )
 
     print(
+        f"Observation : "
+        f"{OBSERVATION_CANDLES} bougies M15",
+        flush=True
+    )
+
+    print(
         "==================================================",
         flush=True
     )
 
     levels = parse_levels()
 
-    print(
-        "[LIQUIDITÉ]",
-        flush=True
-    )
-
-    for level in levels["BSL"]:
+    if levels:
 
         print(
-            f"  BSL : {level:.2f}",
+            "[LIQUIDITÉ]",
             flush=True
         )
 
-    for level in levels["SSL"]:
+        for level in levels:
 
-        print(
-            f"  SSL : {level:.2f}",
-            flush=True
-        )
+            print(
+                f"  - {level:.2f}",
+                flush=True
+            )
 
-    if not all_levels():
+    else:
 
         print(
             "[WARNING] Aucun niveau configuré.",
@@ -1582,61 +1549,46 @@ def trading_loop():
         flush=True
     )
 
-    # --------------------------------------------------------
-    # TEST INITIAL
-    # --------------------------------------------------------
+    candles = get_candles(60)
 
-    candles = get_candles()
-
-    if candles is None:
-
-        print(
-            "[ERREUR] Impossible de récupérer les données.",
-            flush=True
-        )
-
-    else:
+    if candles:
 
         print(
             f"[OK] {len(candles)} bougies M15 reçues.",
             flush=True
         )
 
-        print_candle(candles[-2])
-
-    # --------------------------------------------------------
-    # BOUCLE
-    # --------------------------------------------------------
+        print_candle(
+            candles[-2]
+        )
 
     while bot_running:
 
         try:
 
-            candles = get_candles()
+            candles = get_candles(60)
 
-            if candles is None:
+            if not candles:
 
-                time.sleep(POLL_SECONDS)
+                time.sleep(
+                    POLL_SECONDS
+                )
 
                 continue
 
-            # dernière = bougie en formation
-            # avant-dernière = dernière clôturée
-
+            # Dernière bougie clôturée
             closed_candle = candles[-2]
 
-            candle_time_value = (
+            candle_time = (
                 closed_candle["open_time"]
             )
 
             if (
-                candle_time_value
+                candle_time
                 != last_candle_time
             ):
 
-                last_candle_time = (
-                    candle_time_value
-                )
+                last_candle_time = candle_time
 
                 print(
                     f"\n[{utc_now()}] "
@@ -1648,13 +1600,23 @@ def trading_loop():
                     closed_candle
                 )
 
-                # On transmet uniquement
-                # les bougies clôturées.
-                closed_candles = candles[:-1]
+                # ------------------------------------
+                # 1. Mettre à jour les observations
+                # ------------------------------------
 
-                process_candle(
-                    closed_candles
+                update_active_observations(
+                    closed_candle
                 )
+
+                # ------------------------------------
+                # 2. Chercher de nouveaux contacts
+                # ------------------------------------
+
+                process_liquidity_contacts(
+                    closed_candle
+                )
+
+                save_state()
 
             time.sleep(
                 POLL_SECONDS
@@ -1663,7 +1625,7 @@ def trading_loop():
         except Exception as e:
 
             print(
-                f"[ERREUR LOOP] "
+                f"[LOOP] "
                 f"{type(e).__name__}: {e}",
                 flush=True
             )
@@ -1685,7 +1647,7 @@ def main():
     )
 
     print(
-        "BOT BTC SMC V2 - DEMARRAGE",
+        "BOT BTC SMC V3 - DEMARRAGE",
         flush=True
     )
 
@@ -1694,6 +1656,9 @@ def main():
         flush=True
     )
 
+    load_state()
+
+    # Serveur Render
     web_thread = threading.Thread(
         target=start_web_server,
         daemon=True
@@ -1701,6 +1666,15 @@ def main():
 
     web_thread.start()
 
+    # Telegram
+    telegram_thread = threading.Thread(
+        target=telegram_listener,
+        daemon=True
+    )
+
+    telegram_thread.start()
+
+    # Scanner
     trading_loop()
 
 
