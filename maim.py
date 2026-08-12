@@ -9,67 +9,51 @@ import requests
 
 
 # ============================================================
-# CONFIGURATION
+# BTC SMC BOT V3.1
+# - Binance public M15 data
+# - Liquidity contact detection
+# - Memory of N candles after contact
+# - Structural report
+# - Dynamic swing zones
+# - Telegram commands
+# - Levels saved in state
+# - NO automatic BUY/SELL
 # ============================================================
 
 BINANCE_URL = "https://data-api.binance.vision/api/v3/klines"
 
 SYMBOL = "BTCUSDT"
 INTERVAL = "15m"
-
 POLL_SECONDS = 15
 
-# Nombre de bougies M15 observées APRÈS le contact
-OBSERVATION_CANDLES = int(
-    os.getenv("OBSERVATION_CANDLES", "8")
-)
+OBSERVATION_CANDLES = int(os.getenv("OBSERVATION_CANDLES", "8"))
 
-TELEGRAM_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
-)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
-    ""
-)
-
-LIQUIDITY_LEVELS = os.getenv(
-    "LIQUIDITY_LEVELS",
-    ""
-)
+ENV_LIQUIDITY_LEVELS = os.getenv("LIQUIDITY_LEVELS", "")
 
 STATE_FILE = "smc_state.json"
 
-
-# ============================================================
-# VARIABLES GLOBALES
-# ============================================================
-
 bot_running = True
-
 last_candle_time = None
-
 telegram_offset = 0
 
-# Observations actuellement actives
 active_observations = {}
-
-# Historique terminé
 completed_observations = []
-
-# Nouvelles zones détectées
 dynamic_zones = []
+
+# Levels used by the running bot.
+# Environment variable is used as initial/default configuration.
+current_liquidity_levels = []
 
 
 # ============================================================
-# TEMPS
+# TIME / UTILS
 # ============================================================
 
 def utc_now():
-    return datetime.now(
-        timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def candle_datetime(timestamp):
@@ -79,89 +63,111 @@ def candle_datetime(timestamp):
     ).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def parse_level_string(value):
+    levels = []
+
+    if not value or not value.strip():
+        return levels
+
+    for item in value.split(","):
+        item = item.strip()
+
+        try:
+            levels.append(float(item))
+        except ValueError:
+            print(
+                f"[WARNING] Niveau invalide ignoré : {item}",
+                flush=True
+            )
+
+    # Remove duplicates and sort
+    return sorted(set(levels))
+
+
 # ============================================================
-# STOCKAGE
+# STATE
 # ============================================================
 
 def save_state():
-
     data = {
+        "liquidity_levels": current_liquidity_levels,
         "active_observations": active_observations,
         "completed_observations": completed_observations[-20:],
         "dynamic_zones": dynamic_zones[-100:]
     }
 
     try:
-
-        with open(
-            STATE_FILE,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            json.dump(
-                data,
-                f,
-                indent=2
-            )
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
 
     except Exception as e:
-
         print(
-            f"[STATE] Erreur sauvegarde : {e}",
+            f"[STATE] Erreur sauvegarde : {type(e).__name__} - {e}",
             flush=True
         )
 
 
 def load_state():
-
     global active_observations
     global completed_observations
     global dynamic_zones
+    global current_liquidity_levels
+
+    # Initial/default levels from Render environment.
+    env_levels = parse_level_string(ENV_LIQUIDITY_LEVELS)
 
     if not os.path.exists(STATE_FILE):
+        current_liquidity_levels = env_levels
+        print(
+            "[STATE] Aucun état précédent. "
+            "Niveaux chargés depuis Render.",
+            flush=True
+        )
         return
 
     try:
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
 
+        saved_levels = data.get("liquidity_levels")
+
+        if isinstance(saved_levels, list) and saved_levels:
+            current_liquidity_levels = [
+                float(x) for x in saved_levels
+            ]
+            print(
+                "[STATE] Niveaux Telegram restaurés.",
+                flush=True
+            )
+        else:
+            current_liquidity_levels = env_levels
+
         active_observations = data.get(
-            "active_observations",
-            {}
+            "active_observations", {}
         )
 
         completed_observations = data.get(
-            "completed_observations",
-            []
+            "completed_observations", []
         )
 
         dynamic_zones = data.get(
-            "dynamic_zones",
-            []
+            "dynamic_zones", []
         )
 
-        print(
-            "[STATE] Mémoire restaurée.",
-            flush=True
-        )
+        print("[STATE] Mémoire restaurée.", flush=True)
 
     except Exception as e:
+        current_liquidity_levels = env_levels
 
         print(
-            f"[STATE] Impossible de restaurer : {e}",
+            f"[STATE] Impossible de restaurer : "
+            f"{type(e).__name__} - {e}",
             flush=True
         )
 
 
 # ============================================================
-# SERVEUR HTTP RENDER
+# RENDER HTTP
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -169,37 +175,22 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
 
         if self.path == "/":
-
             self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "text/plain"
-            )
-
+            self.send_header("Content-Type", "text/plain")
             self.end_headers()
-
             self.wfile.write(
-                b"BTC SMC BOT V3 - ONLINE\n"
+                b"BTC SMC BOT V3.1 - ONLINE\n"
             )
 
         elif self.path == "/health":
-
             self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "application/json"
-            )
-
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
-
             self.wfile.write(
-                b'{"status":"online","bot":"BTC SMC V3"}'
+                b'{"status":"online","bot":"BTC SMC V3.1"}'
             )
 
         else:
-
             self.send_response(404)
             self.end_headers()
 
@@ -209,12 +200,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_web_server():
 
-    port = int(
-        os.getenv(
-            "PORT",
-            "10000"
-        )
-    )
+    port = int(os.getenv("PORT", "10000"))
 
     server = HTTPServer(
         ("0.0.0.0", port),
@@ -222,59 +208,11 @@ def start_web_server():
     )
 
     print(
-        f"[{utc_now()}] "
-        f"Serveur HTTP Render actif sur port {port}",
+        f"[{utc_now()}] Serveur HTTP Render actif sur port {port}",
         flush=True
     )
 
     server.serve_forever()
-
-
-# ============================================================
-# LIQUIDITÉ
-# ============================================================
-
-def parse_levels():
-
-    if not LIQUIDITY_LEVELS.strip():
-        return []
-
-    levels = []
-
-    for value in LIQUIDITY_LEVELS.split(","):
-
-        value = value.strip()
-
-        try:
-
-            levels.append(
-                float(value)
-            )
-
-        except ValueError:
-
-            print(
-                f"[WARNING] Niveau invalide : {value}",
-                flush=True
-            )
-
-    return levels
-
-
-def get_current_levels():
-
-    """
-    Les niveaux peuvent venir de Render
-    ou être modifiés avec /levels.
-    """
-
-    if dynamic_zones:
-
-        # Les zones dynamiques ne remplacent pas
-        # les niveaux principaux.
-        pass
-
-    return parse_levels()
 
 
 # ============================================================
@@ -284,21 +222,11 @@ def get_current_levels():
 def telegram_send(message):
 
     if not TELEGRAM_TOKEN:
-
-        print(
-            "[TELEGRAM] Token non configuré.",
-            flush=True
-        )
-
+        print("[TELEGRAM] Token non configuré.", flush=True)
         return False
 
     if not TELEGRAM_CHAT_ID:
-
-        print(
-            "[TELEGRAM] CHAT_ID non configuré.",
-            flush=True
-        )
-
+        print("[TELEGRAM] CHAT_ID non configuré.", flush=True)
         return False
 
     url = (
@@ -312,7 +240,6 @@ def telegram_send(message):
     }
 
     try:
-
         response = requests.post(
             url,
             json=payload,
@@ -320,17 +247,14 @@ def telegram_send(message):
         )
 
         response.raise_for_status()
-
         return True
 
     except Exception as e:
-
         print(
             f"[TELEGRAM] Erreur : "
             f"{type(e).__name__} - {e}",
             flush=True
         )
-
         return False
 
 
@@ -345,7 +269,6 @@ def telegram_api(method, params=None):
     )
 
     try:
-
         response = requests.get(
             url,
             params=params,
@@ -353,33 +276,31 @@ def telegram_api(method, params=None):
         )
 
         response.raise_for_status()
-
         return response.json()
 
     except Exception as e:
-
         print(
             f"[TELEGRAM API] {method} : {e}",
             flush=True
         )
-
         return None
 
 
 # ============================================================
-# COMMANDES TELEGRAM
+# COMMANDS
 # ============================================================
 
 def handle_command(text):
 
-    global LIQUIDITY_LEVELS
-    global active_observations
-    global dynamic_zones
+    global current_liquidity_levels
 
     if not text:
         return
 
     parts = text.strip().split()
+
+    if not parts:
+        return
 
     command = parts[0].lower()
 
@@ -389,11 +310,24 @@ def handle_command(text):
 
     if command == "/start":
 
+        levels_text = (
+            "\n".join(
+                f"• {x:.2f}"
+                for x in current_liquidity_levels
+            )
+            if current_liquidity_levels
+            else "Aucun niveau configuré."
+        )
+
         telegram_send(
-            "🤖 BTC SMC BOT V3\n\n"
-            "Bot opérationnel.\n\n"
-            "Commandes disponibles :\n"
-            "/levels 63900 63600\n"
+            "🤖 BTC SMC BOT V3.1\n\n"
+            "✅ Bot opérationnel.\n"
+            f"📊 {SYMBOL} — {INTERVAL}\n"
+            f"🔎 Observation : {OBSERVATION_CANDLES} bougies M15\n\n"
+            "📍 Niveaux surveillés :\n"
+            f"{levels_text}\n\n"
+            "Commandes :\n"
+            "/levels 63700 63580\n"
             "/levels\n"
             "/status\n"
             "/zones\n"
@@ -411,60 +345,39 @@ def handle_command(text):
 
         if len(parts) == 1:
 
-            levels = parse_levels()
-
-            if not levels:
-
+            if not current_liquidity_levels:
                 telegram_send(
                     "⚠️ Aucun niveau principal configuré."
                 )
-
                 return
 
-            message = (
+            telegram_send(
                 "📊 NIVEAUX PRINCIPAUX\n\n"
-            )
-
-            for i, level in enumerate(
-                levels,
-                start=1
-            ):
-
-                message += (
-                    f"{i}. {level:.2f}\n"
+                + "\n".join(
+                    f"{i}. {level:.2f}"
+                    for i, level in enumerate(
+                        current_liquidity_levels,
+                        start=1
+                    )
                 )
-
-            telegram_send(message)
+            )
 
             return
 
-        new_levels = []
-
-        for value in parts[1:]:
-
-            try:
-
-                new_levels.append(
-                    float(value)
-                )
-
-            except ValueError:
-
-                pass
+        new_levels = parse_level_string(
+            ",".join(parts[1:])
+        )
 
         if not new_levels:
-
             telegram_send(
                 "❌ Aucun niveau valide."
             )
-
             return
 
-        # Mise à jour en mémoire
-        LIQUIDITY_LEVELS = ",".join(
-            str(x)
-            for x in new_levels
-        )
+        current_liquidity_levels = new_levels
+
+        # Sauvegarde immédiate
+        save_state()
 
         telegram_send(
             "✅ NIVEAUX MIS À JOUR\n\n"
@@ -473,13 +386,12 @@ def handle_command(text):
                 for x in new_levels
             )
             + "\n\n"
-            "Le bot surveille maintenant "
-            "ces niveaux."
+            "Le bot surveille maintenant ces niveaux."
         )
 
         print(
             "[LIQUIDITÉ] Niveaux mis à jour via Telegram : "
-            f"{LIQUIDITY_LEVELS}",
+            f"{current_liquidity_levels}",
             flush=True
         )
 
@@ -491,23 +403,20 @@ def handle_command(text):
 
     if command == "/status":
 
-        levels = parse_levels()
-
-        message = (
-            "📡 BTC SMC BOT V3\n\n"
-            f"État : ACTIF\n"
+        telegram_send(
+            "📡 BTC SMC BOT V3.1\n\n"
+            "État : ACTIF\n"
             f"Symbole : {SYMBOL}\n"
             f"Timeframe : {INTERVAL}\n"
-            f"Observation : "
-            f"{OBSERVATION_CANDLES} bougies\n\n"
-            f"Niveaux : {len(levels)}\n"
+            f"Observation : {OBSERVATION_CANDLES} bougies\n\n"
+            f"Niveaux : {len(current_liquidity_levels)}\n"
             f"Observations actives : "
             f"{len(active_observations)}\n"
+            f"Rapports terminés : "
+            f"{len(completed_observations)}\n"
             f"Zones dynamiques : "
             f"{len(dynamic_zones)}"
         )
-
-        telegram_send(message)
 
         return
 
@@ -518,19 +427,14 @@ def handle_command(text):
     if command == "/zones":
 
         if not dynamic_zones:
-
             telegram_send(
                 "📭 Aucune nouvelle zone détectée."
             )
-
             return
 
-        message = (
-            "🧭 NOUVELLES ZONES\n\n"
-        )
+        message = "🧭 NOUVELLES ZONES\n\n"
 
         for zone in dynamic_zones[-10:]:
-
             message += (
                 f"• {zone['type']} : "
                 f"{zone['price']:.2f}\n"
@@ -541,7 +445,6 @@ def handle_command(text):
             )
 
         telegram_send(message)
-
         return
 
     # --------------------------------------------------------
@@ -575,11 +478,17 @@ def handle_command(text):
         save_state()
 
         telegram_send(
-            "🗑️ Mémoire, observations et "
-            "zones dynamiques supprimées."
+            "🗑️ Observations, rapports et "
+            "zones dynamiques supprimés.\n\n"
+            "Les niveaux principaux restent actifs."
         )
 
         return
+
+    telegram_send(
+        "❓ Commande inconnue.\n\n"
+        "Utilise /start pour voir les commandes."
+    )
 
 
 def telegram_listener():
@@ -591,7 +500,7 @@ def telegram_listener():
         flush=True
     )
 
-    # Évite les anciens messages accumulés
+    # Ignore les anciens messages présents avant le démarrage.
     result = telegram_api(
         "getUpdates",
         {
@@ -601,14 +510,9 @@ def telegram_listener():
     )
 
     if result and result.get("ok"):
-
-        updates = result.get(
-            "result",
-            []
-        )
+        updates = result.get("result", [])
 
         if updates:
-
             telegram_offset = (
                 updates[-1]["update_id"] + 1
             )
@@ -626,14 +530,10 @@ def telegram_listener():
             )
 
             if not result or not result.get("ok"):
-
                 time.sleep(3)
                 continue
 
-            updates = result.get(
-                "result",
-                []
-            )
+            updates = result.get("result", [])
 
             for update in updates:
 
@@ -641,9 +541,7 @@ def telegram_listener():
                     update["update_id"] + 1
                 )
 
-                message = update.get(
-                    "message"
-                )
+                message = update.get("message")
 
                 if not message:
                     continue
@@ -652,25 +550,20 @@ def telegram_listener():
                     message["chat"]["id"]
                 )
 
-                # Sécurité : seul ton CHAT_ID
-                # peut contrôler le bot.
+                # Seul le CHAT_ID configuré peut commander le bot.
                 if str(TELEGRAM_CHAT_ID) != chat_id:
-
                     continue
 
-                text = message.get(
-                    "text",
-                    ""
-                )
+                text = message.get("text", "")
 
                 if text.startswith("/"):
-
                     handle_command(text)
 
         except Exception as e:
 
             print(
-                f"[TELEGRAM LOOP] {type(e).__name__}: {e}",
+                f"[TELEGRAM LOOP] "
+                f"{type(e).__name__}: {e}",
                 flush=True
             )
 
@@ -696,7 +589,7 @@ def get_candles(limit=60):
             params=params,
             timeout=15,
             headers={
-                "User-Agent": "BTC-SMC-Bot/3.0"
+                "User-Agent": "BTC-SMC-Bot/3.1"
             }
         )
 
@@ -732,7 +625,7 @@ def get_candles(limit=60):
 
 
 # ============================================================
-# BOUGIE
+# CANDLE
 # ============================================================
 
 def print_candle(candle):
@@ -754,70 +647,47 @@ def print_candle(candle):
 
 
 # ============================================================
-# CONTACT LIQUIDITÉ
+# LIQUIDITY CONTACT
 # ============================================================
 
 def detect_liquidity_touch(candle):
 
-    levels = parse_levels()
-
-    if not levels:
-        return []
-
     touched = []
 
-    for level in levels:
+    for level in current_liquidity_levels:
 
         if (
             candle["low"]
             <= level
             <= candle["high"]
         ):
-
             touched.append(level)
 
     return touched
 
 
 # ============================================================
-# CRÉATION OBSERVATION
+# CREATE OBSERVATION
 # ============================================================
 
-def create_observation(
-    level,
-    candle
-):
+def create_observation(level, candle):
 
     key = str(level)
 
-    # Une observation du même niveau
-    # ne doit pas être recréée.
     if key in active_observations:
-
         return
 
     observation = {
-
         "level": level,
-
         "contact_candle": candle,
-
         "candles": [],
-
         "created_at": utc_now(),
-
         "status": "OBSERVATION",
-
         "reaction": False,
-
         "mss": False,
-
         "displacement": False,
-
         "rejection": False,
-
         "new_zones": []
-
     }
 
     active_observations[key] = observation
@@ -829,8 +699,7 @@ def create_observation(
         "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
         f"🚨 CONTACT LIQUIDITÉ : {level:.2f}\n"
         "→ MÉMOIRE ACTIVÉE\n"
-        f"→ OBSERVATION : "
-        f"{OBSERVATION_CANDLES} M15\n"
+        f"→ OBSERVATION : {OBSERVATION_CANDLES} M15\n"
         "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
         flush=True
     )
@@ -841,21 +710,18 @@ def create_observation(
         f"Timeframe : {INTERVAL}\n"
         f"Bougie contact : "
         f"{candle_datetime(candle['open_time'])}\n\n"
-        f"📋 Mémoire activée.\n"
-        f"Observation des "
-        f"{OBSERVATION_CANDLES} prochaines bougies M15.\n\n"
+        "📋 Mémoire activée.\n"
+        f"Observation des {OBSERVATION_CANDLES} "
+        "prochaines bougies M15.\n\n"
         "⚠️ Aucun BUY/SELL."
     )
 
 
 # ============================================================
-# ANALYSE BOUGIE
+# REJECTION
 # ============================================================
 
-def candle_rejection(
-    candle,
-    level
-):
+def candle_rejection(candle, level):
 
     body = abs(
         candle["close"]
@@ -872,21 +738,14 @@ def candle_rejection(
 
     upper_wick = (
         candle["high"]
-        - max(
-            candle["open"],
-            candle["close"]
-        )
+        - max(candle["open"], candle["close"])
     )
 
     lower_wick = (
-        min(
-            candle["open"],
-            candle["close"]
-        )
+        min(candle["open"], candle["close"])
         - candle["low"]
     )
 
-    # Rejet haussier du niveau
     if (
         candle["low"] <= level
         and candle["close"] > level
@@ -894,7 +753,6 @@ def candle_rejection(
     ):
         return True
 
-    # Rejet baissier du niveau
     if (
         candle["high"] >= level
         and candle["close"] < level
@@ -905,10 +763,11 @@ def candle_rejection(
     return False
 
 
-def detect_displacement(
-    candles,
-    index
-):
+# ============================================================
+# DISPLACEMENT
+# ============================================================
+
+def detect_displacement(candles, index):
 
     if index < 3:
         return False
@@ -922,10 +781,7 @@ def detect_displacement(
 
     previous_ranges = []
 
-    for c in candles[
-        max(0, index - 5):index
-    ]:
-
+    for c in candles[max(0, index - 5):index]:
         previous_ranges.append(
             c["high"] - c["low"]
         )
@@ -938,50 +794,35 @@ def detect_displacement(
         / len(previous_ranges)
     )
 
-    if average_range <= 0:
+    if average_range <= 0 or current_range <= 0:
         return False
 
-    # Displacement objectif :
-    # range nettement supérieur à la moyenne
-    # + clôture proche d'une extrémité.
     bullish_close = (
-        current["close"]
-        - current["low"]
+        current["close"] - current["low"]
     ) / current_range
 
     bearish_close = (
-        current["high"]
-        - current["close"]
+        current["high"] - current["close"]
     ) / current_range
 
-    if (
-        current_range
-        >= average_range * 1.5
-    ):
+    if current_range >= average_range * 1.5:
 
         if (
             bullish_close >= 0.70
             or bearish_close >= 0.70
         ):
-
             return True
 
     return False
 
 
 # ============================================================
-# SWINGS / NOUVELLES ZONES
+# SWINGS / DYNAMIC ZONES
 # ============================================================
 
-def detect_swing_high(
-    candles,
-    index
-):
+def detect_swing_high(candles, index):
 
-    if index < 1:
-        return False
-
-    if index >= len(candles) - 1:
+    if index < 1 or index >= len(candles) - 1:
         return False
 
     return (
@@ -993,15 +834,9 @@ def detect_swing_high(
     )
 
 
-def detect_swing_low(
-    candles,
-    index
-):
+def detect_swing_low(candles, index):
 
-    if index < 1:
-        return False
-
-    if index >= len(candles) - 1:
+    if index < 1 or index >= len(candles) - 1:
         return False
 
     return (
@@ -1021,34 +856,24 @@ def register_dynamic_zone(
 
     source_level = observation["level"]
 
-    # Évite les doublons proches
     for zone in dynamic_zones:
 
         if (
             zone["type"] == zone_type
-            and abs(
-                zone["price"] - price
-            ) < 1.0
+            and abs(zone["price"] - price) < 1.0
         ):
-
             return
 
     zone = {
-
         "type": zone_type,
-
         "price": price,
-
         "source_level": source_level,
-
         "time": utc_now()
     }
 
     dynamic_zones.append(zone)
 
-    observation["new_zones"].append(
-        zone
-    )
+    observation["new_zones"].append(zone)
 
     print(
         f"[NOUVELLE ZONE] "
@@ -1059,53 +884,32 @@ def register_dynamic_zone(
 
 
 # ============================================================
-# MSS OBJECTIF
+# MSS OBJECTIF / DESCRIPTIF
 # ============================================================
 
-def detect_mss(
-    candles
-):
+def detect_mss(candles):
 
     if len(candles) < 4:
         return False
 
-    # Structure simplifiée :
-    # recherche d'un dépassement du dernier
-    # swing pertinent.
-
     last = candles[-1]
 
-    highs = [
-        c["high"]
-        for c in candles[:-1]
-    ]
-
-    lows = [
-        c["low"]
-        for c in candles[:-1]
-    ]
-
-    previous_high = max(highs)
-    previous_low = min(lows)
-
-    bullish_break = (
-        last["close"]
-        > previous_high
+    previous_high = max(
+        c["high"] for c in candles[:-1]
     )
 
-    bearish_break = (
-        last["close"]
-        < previous_low
+    previous_low = min(
+        c["low"] for c in candles[:-1]
     )
 
-    return (
-        bullish_break
-        or bearish_break
-    )
+    bullish_break = last["close"] > previous_high
+    bearish_break = last["close"] < previous_low
+
+    return bullish_break or bearish_break
 
 
 # ============================================================
-# TRAITEMENT D'UNE BOUGIE D'OBSERVATION
+# PROCESS OBSERVATION CANDLE
 # ============================================================
 
 def process_observation_candle(
@@ -1113,68 +917,38 @@ def process_observation_candle(
     candle
 ):
 
-    observation["candles"].append(
-        candle
-    )
+    observation["candles"].append(candle)
 
     candles = observation["candles"]
-
     index = len(candles) - 1
-
-    # ----------------------------------------
-    # Rejet
-    # ----------------------------------------
 
     if candle_rejection(
         candle,
         observation["level"]
     ):
-
         observation["rejection"] = True
         observation["reaction"] = True
-
-    # ----------------------------------------
-    # Displacement
-    # ----------------------------------------
 
     if detect_displacement(
         candles,
         index
     ):
-
         observation["displacement"] = True
         observation["reaction"] = True
 
-    # ----------------------------------------
-    # MSS
-    # ----------------------------------------
-
     if detect_mss(candles):
-
         observation["mss"] = True
         observation["reaction"] = True
-
-    # ----------------------------------------
-    # Swing zones
-    #
-    # On analyse l'avant-dernière bougie,
-    # car elle possède maintenant une bougie
-    # à droite pour confirmer le swing.
-    # ----------------------------------------
 
     if len(candles) >= 3:
 
         swing_index = len(candles) - 2
-
-        swing_candle = candles[
-            swing_index
-        ]
+        swing_candle = candles[swing_index]
 
         if detect_swing_high(
             candles,
             swing_index
         ):
-
             register_dynamic_zone(
                 observation,
                 "SWING_HIGH",
@@ -1185,7 +959,6 @@ def process_observation_candle(
             candles,
             swing_index
         ):
-
             register_dynamic_zone(
                 observation,
                 "SWING_LOW",
@@ -1194,185 +967,95 @@ def process_observation_candle(
 
 
 # ============================================================
-# RAPPORT STRUCTURÉ
+# REPORT
 # ============================================================
 
-def generate_report(
-    observation
-):
+def generate_report(observation):
 
     candles = observation["candles"]
-
     level = observation["level"]
 
-    report = []
-
-    report.append(
-        "📊 RAPPORT BTC SMC — OBSERVATION TERMINÉE"
-    )
-
-    report.append(
-        ""
-    )
-
-    report.append(
-        f"Liquidité surveillée : {level:.2f}"
-    )
-
-    report.append(
-        f"Bougie contact : "
-        f"{candle_datetime(observation['contact_candle']['open_time'])}"
-    )
-
-    report.append(
-        f"Nombre de bougies observées : "
-        f"{len(candles)}"
-    )
-
-    report.append("")
-
-    # ----------------------------------------
-    # Réaction
-    # ----------------------------------------
-
-    report.append(
-        "1️⃣ RÉACTION"
-    )
-
-    report.append(
-        f"Rejet : "
-        f"{'OUI' if observation['rejection'] else 'NON'}"
-    )
-
-    report.append(
-        f"Displacement : "
-        f"{'OUI' if observation['displacement'] else 'NON'}"
-    )
-
-    report.append(
-        f"MSS potentiel : "
-        f"{'OUI' if observation['mss'] else 'NON'}"
-    )
-
-    report.append("")
-
-    # ----------------------------------------
-    # Verdict objectif
-    # ----------------------------------------
-
-    report.append(
-        "2️⃣ ÉTAT DE LA RÉACTION"
-    )
-
-    if observation["reaction"]:
-
-        report.append(
+    report = [
+        "📊 RAPPORT BTC SMC — OBSERVATION TERMINÉE",
+        "",
+        f"Liquidité surveillée : {level:.2f}",
+        "Bougie contact : "
+        f"{candle_datetime(observation['contact_candle']['open_time'])}",
+        f"Nombre de bougies observées : {len(candles)}",
+        "",
+        "1️⃣ RÉACTION",
+        "Rejet : "
+        f"{'OUI' if observation['rejection'] else 'NON'}",
+        "Displacement : "
+        f"{'OUI' if observation['displacement'] else 'NON'}",
+        "MSS potentiel : "
+        f"{'OUI' if observation['mss'] else 'NON'}",
+        "",
+        "2️⃣ ÉTAT DE LA RÉACTION",
+        (
             "🟡 RÉACTION STRUCTURELLE DÉTECTÉE"
-        )
-
-    else:
-
-        report.append(
-            "⚪ AUCUNE RÉACTION EXPLOITABLE"
-        )
-
-    report.append("")
-
-    # ----------------------------------------
-    # Bougies
-    # ----------------------------------------
-
-    report.append(
+            if observation["reaction"]
+            else "⚪ AUCUNE RÉACTION EXPLOITABLE"
+        ),
+        "",
         "3️⃣ BOUGIES M15 MÉMORISÉES"
-    )
+    ]
 
-    for i, candle in enumerate(
-        candles,
-        start=1
-    ):
+    for i, candle in enumerate(candles, start=1):
 
         report.append(
             f"C{i} | "
             f"O {candle['open']:.2f} | "
             f"H {candle['high']:.2f} | "
             f"L {candle['low']:.2f} | "
-            f"C {candle['close']:.2f}"
+            f"C {candle['close']:.2f} | "
+            f"V {candle['volume']:.4f}"
         )
 
-    report.append("")
-
-    # ----------------------------------------
-    # Nouvelles zones
-    # ----------------------------------------
-
-    report.append(
+    report.extend([
+        "",
         "4️⃣ NOUVELLES ZONES / STRUCTURES"
-    )
+    ])
 
     if observation["new_zones"]:
 
         for zone in observation["new_zones"]:
-
             report.append(
                 f"• {zone['type']} : "
                 f"{zone['price']:.2f}"
             )
 
     else:
-
         report.append(
             "Aucune nouvelle zone détectée."
         )
 
-    report.append("")
-
-    # ----------------------------------------
-    # Règle importante
-    # ----------------------------------------
-
-    report.append(
-        "5️⃣ RÈGLE"
-    )
-
-    report.append(
-        "Ce rapport est descriptif."
-    )
-
-    report.append(
-        "Aucun BUY/SELL automatique."
-    )
-
-    report.append(
-        "Aucune entrée validée."
-    )
-
-    report.append(
+    report.extend([
+        "",
+        "5️⃣ RÈGLE",
+        "Ce rapport est descriptif.",
+        "Aucun BUY/SELL automatique.",
+        "Aucune entrée validée.",
         "Analyse sceptique externe nécessaire."
-    )
+    ])
 
     return "\n".join(report)
 
 
 # ============================================================
-# FIN D'OBSERVATION
+# FIN OBSERVATION
 # ============================================================
 
-def finish_observation(
-    key
-):
+def finish_observation(key):
 
-    observation = active_observations.get(
-        key
-    )
+    observation = active_observations.get(key)
 
     if not observation:
         return
 
     observation["status"] = "TERMINEE"
 
-    report = generate_report(
-        observation
-    )
+    report = generate_report(observation)
 
     print(
         "\n"
@@ -1386,9 +1069,7 @@ def finish_observation(
 
     telegram_send(report)
 
-    completed_observations.append(
-        observation
-    )
+    completed_observations.append(observation)
 
     del active_observations[key]
 
@@ -1396,32 +1077,22 @@ def finish_observation(
 
 
 # ============================================================
-# TRAITEMENT DES CONTACTS
+# CONTACTS
 # ============================================================
 
-def process_liquidity_contacts(
-    candle
-):
+def process_liquidity_contacts(candle):
 
-    touched_levels = detect_liquidity_touch(
-        candle
-    )
+    touched_levels = detect_liquidity_touch(candle)
 
     for level in touched_levels:
-
-        create_observation(
-            level,
-            candle
-        )
+        create_observation(level, candle)
 
 
 # ============================================================
-# SURVEILLANCE DES OBSERVATIONS
+# ACTIVE OBSERVATIONS
 # ============================================================
 
-def update_active_observations(
-    candle
-):
+def update_active_observations(candle):
 
     finished = []
 
@@ -1429,22 +1100,15 @@ def update_active_observations(
         active_observations.items()
     ):
 
-        # Ne pas utiliser la bougie contact
-        # comme première bougie d'observation.
-        if (
-            candle["open_time"]
-            <= observation[
-                "contact_candle"
-            ]["open_time"]
-        ):
+        contact_time = observation[
+            "contact_candle"
+        ]["open_time"]
 
+        if candle["open_time"] <= contact_time:
             continue
 
-        # Empêche de mémoriser deux fois
-        # la même bougie.
         already = any(
-            c["open_time"]
-            == candle["open_time"]
+            c["open_time"] == candle["open_time"]
             for c in observation["candles"]
         )
 
@@ -1463,82 +1127,47 @@ def update_active_observations(
         print(
             f"[OBSERVATION] "
             f"Niveau {observation['level']:.2f} "
-            f"→ {count}/"
-            f"{OBSERVATION_CANDLES} bougies",
+            f"→ {count}/{OBSERVATION_CANDLES} bougies",
             flush=True
         )
 
         if count >= OBSERVATION_CANDLES:
-
             finished.append(key)
 
     for key in finished:
-
         finish_observation(key)
 
 
 # ============================================================
-# BOUCLE PRINCIPALE
+# MAIN TRADING LOOP
 # ============================================================
 
 def trading_loop():
 
     global last_candle_time
 
+    print("=" * 50, flush=True)
+    print("BTC SMC BOT V3.1 - PROTOCOLE", flush=True)
+    print("Source : Binance Public Market Data", flush=True)
+    print(f"Symbol : {SYMBOL}", flush=True)
+    print(f"Timeframe : {INTERVAL}", flush=True)
     print(
-        "==================================================",
+        f"Observation : {OBSERVATION_CANDLES} bougies M15",
         flush=True
     )
+    print("=" * 50, flush=True)
 
-    print(
-        "BTC SMC BOT V3 - PROTOCOLE",
-        flush=True
-    )
+    if current_liquidity_levels:
 
-    print(
-        "Source : Binance Public Market Data",
-        flush=True
-    )
+        print("[LIQUIDITÉ]", flush=True)
 
-    print(
-        f"Symbol : {SYMBOL}",
-        flush=True
-    )
-
-    print(
-        f"Timeframe : {INTERVAL}",
-        flush=True
-    )
-
-    print(
-        f"Observation : "
-        f"{OBSERVATION_CANDLES} bougies M15",
-        flush=True
-    )
-
-    print(
-        "==================================================",
-        flush=True
-    )
-
-    levels = parse_levels()
-
-    if levels:
-
-        print(
-            "[LIQUIDITÉ]",
-            flush=True
-        )
-
-        for level in levels:
-
+        for level in current_liquidity_levels:
             print(
                 f"  - {level:.2f}",
                 flush=True
             )
 
     else:
-
         print(
             "[WARNING] Aucun niveau configuré.",
             flush=True
@@ -1558,9 +1187,7 @@ def trading_loop():
             flush=True
         )
 
-        print_candle(
-            candles[-2]
-        )
+        print_candle(candles[-2])
 
     while bot_running:
 
@@ -1569,24 +1196,14 @@ def trading_loop():
             candles = get_candles(60)
 
             if not candles:
-
-                time.sleep(
-                    POLL_SECONDS
-                )
-
+                time.sleep(POLL_SECONDS)
                 continue
 
-            # Dernière bougie clôturée
             closed_candle = candles[-2]
 
-            candle_time = (
-                closed_candle["open_time"]
-            )
+            candle_time = closed_candle["open_time"]
 
-            if (
-                candle_time
-                != last_candle_time
-            ):
+            if candle_time != last_candle_time:
 
                 last_candle_time = candle_time
 
@@ -1596,31 +1213,21 @@ def trading_loop():
                     flush=True
                 )
 
-                print_candle(
-                    closed_candle
-                )
+                print_candle(closed_candle)
 
-                # ------------------------------------
-                # 1. Mettre à jour les observations
-                # ------------------------------------
-
+                # 1. Observations existantes
                 update_active_observations(
                     closed_candle
                 )
 
-                # ------------------------------------
-                # 2. Chercher de nouveaux contacts
-                # ------------------------------------
-
+                # 2. Nouveaux contacts
                 process_liquidity_contacts(
                     closed_candle
                 )
 
                 save_state()
 
-            time.sleep(
-                POLL_SECONDS
-            )
+            time.sleep(POLL_SECONDS)
 
         except Exception as e:
 
@@ -1630,9 +1237,7 @@ def trading_loop():
                 flush=True
             )
 
-            time.sleep(
-                POLL_SECONDS
-            )
+            time.sleep(POLL_SECONDS)
 
 
 # ============================================================
@@ -1641,24 +1246,12 @@ def trading_loop():
 
 def main():
 
-    print(
-        "==================================================",
-        flush=True
-    )
-
-    print(
-        "BOT BTC SMC V3 - DEMARRAGE",
-        flush=True
-    )
-
-    print(
-        "==================================================",
-        flush=True
-    )
+    print("=" * 50, flush=True)
+    print("BOT BTC SMC V3.1 - DEMARRAGE", flush=True)
+    print("=" * 50, flush=True)
 
     load_state()
 
-    # Serveur Render
     web_thread = threading.Thread(
         target=start_web_server,
         daemon=True
@@ -1666,7 +1259,6 @@ def main():
 
     web_thread.start()
 
-    # Telegram
     telegram_thread = threading.Thread(
         target=telegram_listener,
         daemon=True
@@ -1674,10 +1266,8 @@ def main():
 
     telegram_thread.start()
 
-    # Scanner
     trading_loop()
 
 
 if __name__ == "__main__":
-
     main()
